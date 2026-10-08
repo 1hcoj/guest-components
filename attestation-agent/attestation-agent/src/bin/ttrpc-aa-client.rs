@@ -59,12 +59,22 @@ enum Operation {
     ExtendRuntimeMeasurement(ExtendRuntimeMeasurementArgs),
 }
 
+#[derive(Clone, Debug)]
+struct RuntimeData(Vec<u8>);
+
+fn parse_runtime_data(value: &str) -> Result<RuntimeData, String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map(RuntimeData)
+        .map_err(|err| format!("runtime data must be valid standard Base64: {err}"))
+}
+
 #[derive(Args)]
 #[command(author, version, about, long_about = None)]
 struct GetEvidenceArgs {
-    /// base64 encodede runtime data
-    #[arg(short, long)]
-    runtime_data: String,
+    /// Base64-encoded runtime data
+    #[arg(short, long, value_parser = parse_runtime_data)]
+    runtime_data: RuntimeData,
 }
 
 #[derive(Args)]
@@ -114,11 +124,8 @@ pub async fn main() {
             println!("{}", res.tee);
         }
         Operation::GetEvidence(args) => {
-            let runtime_data = base64::engine::general_purpose::STANDARD
-                .decode(args.runtime_data)
-                .unwrap();
             let req = GetEvidenceRequest {
-                RuntimeData: runtime_data,
+                RuntimeData: args.runtime_data.0,
                 ..Default::default()
             };
             let res = client
@@ -166,6 +173,40 @@ pub async fn main() {
                     "Runtime measurement is not enabled in Attestation Agent configuration."
                 ),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_runtime_data_during_cli_parsing() {
+        for value in ["12345", "!!!!"] {
+            let err =
+                Cli::try_parse_from(["ttrpc-aa-client", "get-evidence", "--runtime-data", value])
+                    .err()
+                    .expect("invalid Base64 must be rejected");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn preserves_decoded_runtime_data_bytes() {
+        for (value, expected) in [
+            ("MTIzNDU=", b"12345".as_slice()),
+            ("/w==", &[255][..]),
+            ("", &[][..]),
+        ] {
+            let cli =
+                Cli::try_parse_from(["ttrpc-aa-client", "get-evidence", "--runtime-data", value])
+                    .expect("valid Base64 must be accepted");
+            let Operation::GetEvidence(args) = cli.operation else {
+                panic!("expected GetEvidence");
+            };
+            assert_eq!(args.runtime_data.0, expected);
         }
     }
 }
