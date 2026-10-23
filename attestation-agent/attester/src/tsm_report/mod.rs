@@ -9,6 +9,9 @@ use strum::EnumString;
 use tempfile::tempdir_in;
 use thiserror::Error;
 const TSM_REPORT_PATH: &str = "/sys/kernel/config/tsm/report";
+const SVSM_SERVICE_PROVIDER: &str = "svsm";
+pub const SVSM_VTPM_SERVICE_GUID: &str = "c476f1eb-0123-45a5-9641-b4e7dde5bfe3";
+const SVSM_REPORT_DATA_SIZE: usize = 64;
 
 #[derive(Error, Debug)]
 pub enum TsmReportError {
@@ -28,6 +31,14 @@ pub enum TsmReportError {
     InblobConflict(u32),
     #[error("Failed to generate TSM Report: missing inblob (len=0)")]
     InblobLen,
+    #[error("Failed to generate SVSM TSM Report: invalid inblob length (len={0}, expected 64)")]
+    SvsmInblobLen(usize),
+    #[error("Failed to generate SVSM TSM Report: missing manifestblob (len=0)")]
+    SvsmManifestLen,
+    #[error(
+        "Failed to generate SVSM TSM Report: write conflict (generation={generation}, expected {expected})"
+    )]
+    SvsmWriteConflict { generation: u32, expected: u32 },
 }
 
 #[derive(PartialEq, Debug, EnumString)]
@@ -44,6 +55,28 @@ pub enum TsmReportData {
     Cca(Vec<u8>),
     Tdx(Vec<u8>),
     Sev(Vec<u8>),
+}
+
+/// Input for an SVSM vTPM attestation request.
+///
+/// The report data is passed to SVSM as a 64-byte nonce. When
+/// `service_manifest_version` is `None`, SVSM returns the service's default
+/// manifest version.
+#[derive(Debug)]
+pub struct SvsmVtpmReportRequest {
+    pub report_data: Vec<u8>,
+    pub service_manifest_version: Option<u32>,
+}
+
+/// Raw blobs returned by an SVSM vTPM attestation request.
+#[derive(Debug, PartialEq)]
+pub struct SvsmVtpmReportResponse {
+    /// SNP attestation report whose REPORT_DATA binds the nonce and manifest.
+    pub report: Vec<u8>,
+    /// vTPM service manifest containing the EK public area.
+    pub manifest: Vec<u8>,
+    /// Optional certificate table returned with the SNP report.
+    pub auxiliary: Vec<u8>,
 }
 
 /// TsmReportPath instance represents a unique path on ConfigFS
@@ -118,6 +151,63 @@ impl TsmReportPath {
 
         Ok(aux)
     }
+
+    /// Request an SNP attestation report and vTPM manifest from SVSM.
+    pub fn svsm_vtpm_attestation_report(
+        &self,
+        request: SvsmVtpmReportRequest,
+    ) -> Result<SvsmVtpmReportResponse, TsmReportError> {
+        svsm_vtpm_attestation_report(self.path.as_path(), request)
+    }
+}
+
+fn svsm_vtpm_attestation_report(
+    report_path: &Path,
+    request: SvsmVtpmReportRequest,
+) -> Result<SvsmVtpmReportResponse, TsmReportError> {
+    if request.report_data.len() != SVSM_REPORT_DATA_SIZE {
+        return Err(TsmReportError::SvsmInblobLen(request.report_data.len()));
+    }
+
+    // Configure the SVSM service before writing inblob, which triggers report
+    // generation. A non-null GUID selects the vTPM single-service request.
+    std::fs::write(report_path.join("service_provider"), SVSM_SERVICE_PROVIDER)
+        .map_err(|e| TsmReportError::Access("service_provider", e))?;
+    std::fs::write(report_path.join("service_guid"), SVSM_VTPM_SERVICE_GUID)
+        .map_err(|e| TsmReportError::Access("service_guid", e))?;
+
+    let mut expected_generation = 2;
+    if let Some(version) = request.service_manifest_version {
+        std::fs::write(
+            report_path.join("service_manifest_version"),
+            version.to_string(),
+        )
+        .map_err(|e| TsmReportError::Access("service_manifest_version", e))?;
+        expected_generation += 1;
+    }
+
+    std::fs::write(report_path.join("inblob"), request.report_data)
+        .map_err(|e| TsmReportError::Access("inblob", e))?;
+    expected_generation += 1;
+
+    let report = std::fs::read(report_path.join("outblob"))
+        .map_err(|e| TsmReportError::Access("outblob", e))?;
+    let manifest = std::fs::read(report_path.join("manifestblob"))
+        .map_err(|e| TsmReportError::Access("manifestblob", e))?;
+    let auxiliary = std::fs::read(report_path.join("auxblob"))
+        .map_err(|e| TsmReportError::Access("auxblob", e))?;
+
+    check_svsm_write_race(report_path, expected_generation)?;
+
+    if manifest.is_empty() {
+        return Err(TsmReportError::SvsmManifestLen);
+    }
+
+    Ok(SvsmVtpmReportResponse {
+        report,
+        manifest,
+        auxiliary,
+    })
 }
 
 /// check_inblob_write_race checks that the returned outblob/auxblob
@@ -126,20 +216,39 @@ impl TsmReportPath {
 /// the race condition that someone else could use the same temporary
 /// directory to generate a quote.
 fn check_inblob_write_race(report_path: &Path) -> Result<(), TsmReportError> {
-    let g = std::fs::read_to_string(report_path.join("generation"))
-        .map_err(|e| TsmReportError::Access("generation", e))?;
-
-    let generation = g
-        .trim_matches('\n')
-        .to_string()
-        .parse::<u32>()
-        .map_err(TsmReportError::Parse)?;
+    let generation = read_generation(report_path)?;
 
     if generation > 1 {
         return Err(TsmReportError::InblobConflict(generation));
     }
 
     Ok(())
+}
+
+fn check_svsm_write_race(
+    report_path: &Path,
+    expected_generation: u32,
+) -> Result<(), TsmReportError> {
+    let generation = read_generation(report_path)?;
+
+    if generation != expected_generation {
+        return Err(TsmReportError::SvsmWriteConflict {
+            generation,
+            expected: expected_generation,
+        });
+    }
+
+    Ok(())
+}
+
+fn read_generation(report_path: &Path) -> Result<u32, TsmReportError> {
+    let generation = std::fs::read_to_string(report_path.join("generation"))
+        .map_err(|e| TsmReportError::Access("generation", e))?;
+
+    generation
+        .trim_matches('\n')
+        .parse::<u32>()
+        .map_err(TsmReportError::Parse)
 }
 
 /// check_tsm_report_provider checks that the TEE is
@@ -191,5 +300,122 @@ mod tests {
             ),
             _ => unimplemented!(),
         }
+    }
+
+    fn create_svsm_test_report(generation: u32, manifest: &[u8]) -> tempfile::TempDir {
+        let tsm_dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(tsm_dir.path().join("generation"), generation.to_string()).unwrap();
+        std::fs::write(tsm_dir.path().join("outblob"), b"snp-report").unwrap();
+        std::fs::write(tsm_dir.path().join("manifestblob"), manifest).unwrap();
+        std::fs::write(tsm_dir.path().join("auxblob"), b"certificates").unwrap();
+
+        tsm_dir
+    }
+
+    #[test]
+    fn test_svsm_vtpm_report_without_manifest_version() {
+        let tsm_dir = create_svsm_test_report(3, b"ek-public");
+        let report_data = vec![0x5a; SVSM_REPORT_DATA_SIZE];
+
+        let response = svsm_vtpm_attestation_report(
+            tsm_dir.path(),
+            SvsmVtpmReportRequest {
+                report_data: report_data.clone(),
+                service_manifest_version: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.report, b"snp-report");
+        assert_eq!(response.manifest, b"ek-public");
+        assert_eq!(response.auxiliary, b"certificates");
+        assert_eq!(
+            std::fs::read_to_string(tsm_dir.path().join("service_provider")).unwrap(),
+            SVSM_SERVICE_PROVIDER
+        );
+        assert_eq!(
+            std::fs::read_to_string(tsm_dir.path().join("service_guid")).unwrap(),
+            SVSM_VTPM_SERVICE_GUID
+        );
+        assert_eq!(
+            std::fs::read(tsm_dir.path().join("inblob")).unwrap(),
+            report_data
+        );
+        assert!(!tsm_dir.path().join("service_manifest_version").exists());
+    }
+
+    #[test]
+    fn test_svsm_vtpm_report_with_manifest_version() {
+        let tsm_dir = create_svsm_test_report(4, b"ek-public");
+
+        svsm_vtpm_attestation_report(
+            tsm_dir.path(),
+            SvsmVtpmReportRequest {
+                report_data: vec![0; SVSM_REPORT_DATA_SIZE],
+                service_manifest_version: Some(2),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tsm_dir.path().join("service_manifest_version")).unwrap(),
+            "2"
+        );
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(63)]
+    #[case(65)]
+    fn test_svsm_vtpm_report_rejects_invalid_report_data_length(#[case] length: usize) {
+        let tsm_dir = tempfile::tempdir().unwrap();
+
+        let result = svsm_vtpm_attestation_report(
+            tsm_dir.path(),
+            SvsmVtpmReportRequest {
+                report_data: vec![0; length],
+                service_manifest_version: None,
+            },
+        );
+
+        assert!(matches!(result, Err(TsmReportError::SvsmInblobLen(len)) if len == length));
+        assert!(!tsm_dir.path().join("service_provider").exists());
+    }
+
+    #[test]
+    fn test_svsm_vtpm_report_rejects_empty_manifest() {
+        let tsm_dir = create_svsm_test_report(3, b"");
+
+        let result = svsm_vtpm_attestation_report(
+            tsm_dir.path(),
+            SvsmVtpmReportRequest {
+                report_data: vec![0; SVSM_REPORT_DATA_SIZE],
+                service_manifest_version: None,
+            },
+        );
+
+        assert!(matches!(result, Err(TsmReportError::SvsmManifestLen)));
+    }
+
+    #[test]
+    fn test_svsm_vtpm_report_detects_write_conflict() {
+        let tsm_dir = create_svsm_test_report(4, b"ek-public");
+
+        let result = svsm_vtpm_attestation_report(
+            tsm_dir.path(),
+            SvsmVtpmReportRequest {
+                report_data: vec![0; SVSM_REPORT_DATA_SIZE],
+                service_manifest_version: None,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(TsmReportError::SvsmWriteConflict {
+                generation: 4,
+                expected: 3
+            })
+        ));
     }
 }
